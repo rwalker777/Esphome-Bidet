@@ -1,6 +1,7 @@
 substitutions:
-  name: "bidet"
-  friendly_name: "Bidet"
+  name: "master-toilet"
+  friendly_name: "Master Toilet"
+  esp32_board: m5stack-atoms3
   ir_transmit_pin: GPIO2
 
 esphome:
@@ -8,7 +9,7 @@ esphome:
   friendly_name: ${friendly_name}
 
 esp32:
-  board: m5stack-atoms3
+  board: $esp32_board
   framework:
     type: esp-idf
     version: recommended
