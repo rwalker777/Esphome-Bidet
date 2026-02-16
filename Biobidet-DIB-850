@@ -2,6 +2,7 @@ substitutions:
   name: "master-toilet"
   friendly_name: "Master Toilet"
   esp32_board: m5stack-atoms3
+  ir_receiver_pin: GPIO1
   ir_transmit_pin: GPIO2
 
 esphome:
@@ -43,18 +44,32 @@ web_server:
 # HARDWARE SETUP
 # ---------------------------------------------------------
 # ---------------------------------------------------------
+# STATE VARIABLES
+# These store the current state of the toilet locally
+# ---------------------------------------------------------
+globals:
+  - id: energy_idx
+    type: int
+    initial_value: '0' # 0=Off, 1=Eco, 2=Smart
+  - id: seat_idx
+    type: int
+    initial_value: '0' # 0=Off, 1=Low, 2=Med, 3=High
+  - id: water_idx
+    type: int
+    initial_value: '0' # 0=Off, 1=Low, 2=Med, 3=High
+
+# ---------------------------------------------------------
 # IR RECEIVER (INPUT)
 # ---------------------------------------------------------
 remote_receiver:
-  # Since GPIO2 is TX, GPIO1 (White Wire) is RX
   pin: 
-    number: GPIO1
+    number: $ir_receiver_pin
     inverted: true
     mode:
       input: true
       pullup: true
   
-  # Dump everything so we can see the raw bidet codes
+  # Dump everything
   dump: all
   
   # Settings for capturing long/complex signals
@@ -63,29 +78,85 @@ remote_receiver:
   filter: 50us
   idle: 20ms
 
+  # Remote decode
+  on_lg:
+    then:
+      - lambda: |-
+          uint32_t data = x.data;
+
+          // 1. FILTER: Only process commands starting with 0x13184B
+          // We mask the last 8 bits (0xFFFFFF00) to check the prefix
+          if ((data & 0xFFFFFF00) != 0x13184B00) {
+            return; 
+          }
+
+          ESP_LOGD("custom", "External Remote Command Detected: 0x%08X", data);
+
+          // -------------------------------------------------------
+          // DECODE WATER (The last nibble: 0x..4B-X)
+          // -------------------------------------------------------
+          int w = data & 0xF;
+          if (w == 0xC) {
+            id(sel_water).publish_state("High");
+            id(water_idx) = 12;
+          } else if (w == 0x4) {
+            id(sel_water).publish_state("Medium");
+            id(water_idx) = 4;
+          } else if (w == 0x8) {
+            id(sel_water).publish_state("Low");
+            id(water_idx) = 8;
+          } else { 
+            // 0x0 or anything else
+            id(sel_water).publish_state("Off");
+            id(water_idx) = 0;
+          }
+
+          // -------------------------------------------------------
+          // DECODE ENERGY & SEAT (The 2nd to last nibble: 0x..4-X-.)
+          // -------------------------------------------------------
+          int es = (data >> 4) & 0xF;
+
+          // Energy is the high bits of this nibble (8, 4, 0)
+          // We apply a mask (0xC = 1100 binary) to ignore the seat bits
+          int e = es & 0xC; 
+          if (e == 0x8) {
+            id(sel_energy).publish_state("Eco");
+            id(energy_idx) = 1;
+          } else if (e == 0x4) {
+            id(sel_energy).publish_state("Smart");
+            id(energy_idx) = 2;
+          } else {
+            id(sel_energy).publish_state("Off");
+            id(energy_idx) = 0;
+          }
+
+          // Seat is the low bits of this nibble (0, 1, 2, 3)
+          int s = es & 0x3;
+          
+          if (s == 3) {
+            id(sel_seat).publish_state("High");
+            id(seat_idx) = 3;
+          } else if (s == 2) { 
+            // CHANGED: Value 2 is now LOW
+            id(sel_seat).publish_state("Low");
+            id(seat_idx) = 2;
+          } else if (s == 1) {
+            // CHANGED: Value 1 is now MEDIUM
+            id(sel_seat).publish_state("Medium");
+            id(seat_idx) = 1;
+          } else {
+            id(sel_seat).publish_state("Off");
+            id(seat_idx) = 0;
+          }
+
 # ---------------------------------------------------------
 # IR TRANSMITTER (OUTPUT)
 # ---------------------------------------------------------
 remote_transmitter:
   id: ir_transmitter
-  # User confirmed GPIO2 is the Transmitter
   pin: $ir_transmit_pin
+  non_blocking: true
   carrier_duty_percent: 50%
-
-# ---------------------------------------------------------
-# STATE VARIABLES
-# These store the current state of the toilet locally
-# ---------------------------------------------------------
-globals:
-  - id: energy_idx
-    type: int
-    initial_value: '0' # 0=Off, 1=Auto, 2=Smart
-  - id: seat_idx
-    type: int
-    initial_value: '0' # 0=Off, 1=Low, 2=Med, 3=High
-  - id: water_idx
-    type: int
-    initial_value: '0' # 0=Off, 1=Low, 2=Med, 3=High
 
 # ---------------------------------------------------------
 # DROPDOWN SELECTORS
@@ -114,8 +185,8 @@ select:
     set_action:
       - lambda: |-
           if (x == "Off") id(seat_idx) = 0;
-          else if (x == "Low") id(seat_idx) = 1;
-          else if (x == "Medium") id(seat_idx) = 2;
+          else if (x == "Low") id(seat_idx) = 2;     // Reversed with Med
+          else if (x == "Medium") id(seat_idx) = 1;  // Reversed with Low
           else if (x == "High") id(seat_idx) = 3;
           id(transmit_logic).execute();
 
@@ -127,10 +198,10 @@ select:
     options: ["Off", "Low", "Medium", "High"]
     set_action:
       - lambda: |-
-          if (x == "Off") id(water_idx) = 0;
-          else if (x == "Low") id(water_idx) = 1;
-          else if (x == "Medium") id(water_idx) = 2;
-          else if (x == "High") id(water_idx) = 3;
+          if (x == "Off") id(water_idx) = 0;      // 0x0
+          else if (x == "Low") id(water_idx) = 8; // 0x8
+          else if (x == "Medium") id(water_idx) = 4; // 0x4
+          else if (x == "High") id(water_idx) = 12;  // 0xC
           id(transmit_logic).execute();
 
 # ---------------------------------------------------------
@@ -145,35 +216,22 @@ script:
           transmitter_id: ir_transmitter
           nbits: 32
           data: !lambda |-
-            // 1. Base Header
             uint32_t code = 0x13184B00;
 
-            // 2. Calculate Water (Last Digit)
-            // Mapping: High->0, Low->4, Med->C, Off->8
-            int w = id(water_idx);
-            int water_nibble = 0x8; // Default Off
-            if (w == 1) water_nibble = 0x4;      // Low
-            else if (w == 2) water_nibble = 0xC; // Med
-            else if (w == 3) water_nibble = 0x0; // High
-            
-            code |= water_nibble;
+            // 1. Add Water (Last Digit)
+            // Values are now pre-calculated in the Select component (0, 4, 8, 12)
+            code |= id(water_idx);
 
-            // 3. Calculate Energy (Upper Bits of 2nd Digit)
-            // Mapping: Off->0, Eco->4, Smart->8
-            // We shift left by 4 to target the 2nd to last digit
+            // 2. Add Energy (Upper Bits of 2nd Digit)
             int e = id(energy_idx);
             int energy_val = 0;
-            if (e == 1) energy_val = 4; // Eco
-            else if (e == 2) energy_val = 8; // Smart
-            
+            if (e == 1) energy_val = 8; // Auto
+            else if (e == 2) energy_val = 4; // Smart
             code |= (energy_val << 4);
 
-            // 4. Calculate Seat (Lower Bits of 2nd Digit)
-            // Mapping: Off->0, Low->1, Med->2, High->3
-            // This adds directly to the Energy value we just set
+            // 3. Add Seat (Lower Bits of 2nd Digit)
             int s = id(seat_idx);
             code |= (s << 4);
 
-            // 5. Log and Return
             ESP_LOGI("custom", "Sending Calculated LG Code: 0x%08X", code);
             return code;
